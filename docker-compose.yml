@@ -1,0 +1,57 @@
+# Local development services for Dropship Command Center.
+#
+# Brings up the managed-equivalent infrastructure on your machine:
+#   - Postgres 16 (the app database, via Prisma)
+#   - Redis 7    (BullMQ queues for webhooks, sync jobs, scheduled tasks)
+#
+# Usage:
+#   docker compose up -d        # start both services in the background
+#   docker compose ps           # check health
+#   docker compose down         # stop (data persists in named volumes)
+#   docker compose down -v      # stop AND wipe all data
+#
+# The defaults below intentionally match the example DATABASE_URL / REDIS_URL
+# in .env.example so the stack works with zero edits for local dev. These
+# credentials are for LOCAL ONLY — production uses managed Postgres/Redis with
+# secrets from the host environment.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dropship-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dropship
+      POSTGRES_PASSWORD: dropship
+      POSTGRES_DB: dropship
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` returns 0 only once Postgres can accept connections, so
+      # scripts (and Prisma migrations) can wait on a healthy container.
+      test: ["CMD-SHELL", "pg_isready -U dropship -d dropship"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: dropship-redis
+    restart: unless-stopped
+    # `--appendonly yes` persists the queue to disk so jobs survive a restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:

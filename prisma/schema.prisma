@@ -1,0 +1,332 @@
+// Dropship Command Center — Prisma schema v1 (SPEC 0.4).
+//
+// Conventions (CLAUDE.md):
+//  - Tenant isolation: every domain table carries a storeId. Store-owned data
+//    cascades on store delete; cross-store lookups (suppliers, research) keep a
+//    nullable storeId and SetNull so the row survives.
+//  - Money is ALWAYS integer cents (never floats), paired with a currency code.
+//  - Closed value sets the app controls are enums; open value sets that mirror
+//    external systems (Shopify product/order statuses) stay String for forward-
+//    compat with API changes.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  // Prisma 7: connection URLs live in prisma.config.ts (migrations) and on the
+  // PrismaClient driver adapter (runtime, see lib/db.ts) — not here.
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Platform {
+  SHOPIFY
+  // WOOCOMMERCE added in Phase 5.5 (second platform driver).
+}
+
+enum StoreStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum SupplierType {
+  AUTODS
+  SPOCKET
+  CJ
+  MANUAL
+}
+
+enum AdChannel {
+  GOOGLE
+  META
+  TIKTOK
+  OTHER
+}
+
+enum SyncKind {
+  ORDERS
+  PRODUCTS
+  STOCK
+  PRICES
+  ADS
+}
+
+enum ResearchStatus {
+  IDEA
+  TESTING
+  LIVE
+  KILLED
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ListingDraftStatus {
+  DRAFT // AI-generated, awaiting human review
+  APPROVED // owner signed off; safe to publish (publishing itself is later)
+}
+
+enum FulfillmentTaskStatus {
+  PENDING // needs to be placed with the supplier
+  PLACED // ordered from supplier, awaiting tracking
+  SHIPPED // tracking captured / fulfilled
+  CANCELLED
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model Store {
+  id             String      @id @default(cuid())
+  name           String
+  platform       Platform    @default(SHOPIFY)
+  shopDomain     String      @unique // e.g. my-store.myshopify.com
+  accessTokenEnc String // AES-256-GCM ciphertext (lib/crypto.ts, task 1.1)
+  status         StoreStatus @default(ACTIVE)
+  currency       String // ISO 4217, e.g. "USD"
+  createdAt      DateTime    @default(now())
+
+  products      Product[]
+  orders        Order[]
+  adSpend          AdSpend[]
+  syncLogs         SyncLog[]
+  researchItems    ResearchItem[]
+  alerts           Alert[]
+  fulfillmentTasks FulfillmentTask[]
+  dailyMetrics     DailyMetric[]
+  launchTasks      LaunchTask[]
+}
+
+model Product {
+  id              String   @id @default(cuid())
+  storeId         String
+  store           Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  shopifyProductId String
+  title           String
+  status          String // Shopify: ACTIVE / ARCHIVED / DRAFT
+  supplierId      String?
+  supplier        Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  costCents       Int // supplier unit cost
+  shipCostCents   Int // supplier shipping cost
+  priceCents      Int // sell price
+  compareAtCents  Int? // strike-through / RRP
+  niche           String?
+  researchScore   Int? // 0-100
+  createdAt       DateTime @default(now())
+
+  orderItems   OrderItem[]
+  dailyMetrics DailyMetric[]
+
+  @@unique([storeId, shopifyProductId]) // dedupe on product import upserts
+  @@index([storeId])
+}
+
+model DailyMetric {
+  id               String   @id @default(cuid())
+  storeId          String
+  store            Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  productId        String? // null = store-level rollup for the day
+  product          Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+  date             DateTime @db.Date
+  orders           Int      @default(0)
+  revenueCents     Int      @default(0)
+  costCents        Int      @default(0) // COGS incl. supplier shipping
+  paymentFeesCents Int      @default(0)
+  refundCents      Int      @default(0)
+  profitCents      Int      @default(0)
+
+  // Rows are rebuilt per (store, date) via delete+recreate, so no unique needed.
+  @@index([storeId, date])
+  @@index([productId])
+}
+
+model Supplier {
+  id        String       @id @default(cuid())
+  name      String
+  type      SupplierType
+  apiKeyEnc String? // encrypted supplier API key (optional; MANUAL has none)
+  notes     String?
+
+  products Product[]
+}
+
+model Order {
+  id                  String   @id @default(cuid())
+  storeId             String
+  store               Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  shopifyOrderId      String
+  orderNumber         String
+  placedAt            DateTime
+  financialStatus     String // Shopify: paid / pending / refunded / ...
+  fulfillmentStatus   String? // Shopify: fulfilled / partial / null
+  customerEmail       String?
+  revenueCents        Int
+  shippingChargedCents Int
+  taxCents            Int
+  refundCents         Int      @default(0) // total refunded (SPEC 3.4)
+  currency            String
+
+  items            OrderItem[]
+  fulfillmentTasks FulfillmentTask[]
+
+  @@unique([storeId, shopifyOrderId]) // dedupe on order backfill/webhook upserts
+  @@index([storeId, placedAt])
+}
+
+model FulfillmentTask {
+  id              String            @id @default(cuid())
+  storeId         String
+  store           Store             @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  orderId         String
+  order           Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  supplierType    SupplierType
+  status          FulfillmentTaskStatus @default(PENDING)
+  supplierUrl     String? // one-click link to place the order at the supplier
+  externalOrderId String? // supplier's order id when placed via API
+  trackingNumber  String?
+  carrier         String?
+  notes           String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@unique([orderId]) // one fulfillment task per order (v1)
+  @@index([storeId, status])
+}
+
+model OrderItem {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String?
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  qty       Int
+  priceCents Int // charged unit price
+  costCents Int // COGS snapshot at order time
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model AdSpend {
+  id           String    @id @default(cuid())
+  storeId      String
+  store        Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  date         DateTime  @db.Date
+  channel      AdChannel
+  campaignName String
+  spendCents   Int
+  clicks       Int       @default(0)
+  impressions  Int       @default(0)
+  conversions  Int       @default(0)
+
+  @@unique([storeId, date, channel]) // one rollup row per store/day/channel
+}
+
+model SyncLog {
+  id           String    @id @default(cuid())
+  storeId      String?
+  store        Store?    @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  kind         SyncKind
+  startedAt    DateTime  @default(now())
+  finishedAt   DateTime?
+  ok           Boolean   @default(false)
+  itemsTouched Int       @default(0)
+  errorText    String?
+
+  @@index([storeId])
+}
+
+model ResearchItem {
+  id                String         @id @default(cuid())
+  title             String
+  sourceUrl         String?
+  niche             String?
+  supplierCostCents Int?
+  estPriceCents     Int?
+  score             Int? // 0-100 (Claude product score, Phase 4.1)
+  scoreRationale    String?
+  status            ResearchStatus @default(IDEA)
+  storeId           String?
+  store             Store?         @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  createdAt         DateTime       @default(now())
+
+  listingDraft ListingDraft?
+
+  @@index([storeId])
+}
+
+// AI-generated listing copy for a research candidate being tested (SPEC 4.2).
+// One current draft per research item; regenerating overwrites it and resets
+// approval. Subordinate to ResearchItem (reached via it), so no storeId of its
+// own — same pattern as OrderItem.
+model ListingDraft {
+  id             String             @id @default(cuid())
+  researchItemId String             @unique
+  researchItem   ResearchItem       @relation(fields: [researchItemId], references: [id], onDelete: Cascade)
+  title          String
+  description    String
+  adAngles       String[]           @default([]) // 5 marketing angles
+  rsaSets        Json // 3 Google RSA asset sets: [{ headlines[], descriptions[] }]
+  status         ListingDraftStatus @default(DRAFT)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+}
+
+// Per-store launch checklist (SPEC 4.3). Rows are instantiated from the code
+// template in lib/playbook/template.ts (idempotently, keyed by `key`), so a new
+// store gets the full checklist and existing stores pick up newly added steps.
+model LaunchTask {
+  id          String    @id @default(cuid())
+  storeId     String
+  store       Store     @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  key         String // stable template key, e.g. "policy-shipping"
+  groupName   String // category, e.g. "Trust & policies"
+  title       String
+  description String?
+  sortOrder   Int       @default(0)
+  done        Boolean   @default(false)
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([storeId, key]) // idempotent instantiate; one task per key per store
+  @@index([storeId])
+}
+
+model Alert {
+  id        String        @id @default(cuid())
+  storeId   String?
+  store     Store?        @relation(fields: [storeId], references: [id], onDelete: SetNull)
+  severity  AlertSeverity
+  kind      String // e.g. MARGIN_BREACH, STOCKOUT, SYNC_FAILURE
+  message   String
+  createdAt DateTime      @default(now())
+  readAt    DateTime?
+
+  @@index([storeId])
+}
+
+// AI-written weekly portfolio review (SPEC 4.4). An owner-level, cross-store
+// artifact (not tenant data), so it has no storeId — it explicitly aggregates
+// every store. Generated by the Sunday cron or a manual "run now".
+model PortfolioReview {
+  id          String    @id @default(cuid())
+  periodStart DateTime  @db.Date
+  periodEnd   DateTime  @db.Date
+  content     String // markdown review
+  emailedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([createdAt])
+}

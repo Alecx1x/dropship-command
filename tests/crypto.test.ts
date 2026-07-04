@@ -20,7 +20,7 @@ afterEach(() => {
 
 describe("crypto (AES-256-GCM)", () => {
   it("round-trips a secret", () => {
-    const secret = "test-shopify-token-placeholder-0123456789";
+    const secret = "dummy-shopify-token-for-round-trip-test";
     expect(decrypt(encrypt(secret))).toBe(secret);
   });
 

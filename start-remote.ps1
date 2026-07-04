@@ -12,6 +12,18 @@ $log = Join-Path $PSScriptRoot "tunnel.log"
 $cf  = Join-Path $PSScriptRoot "cloudflared.exe"
 Remove-Item $log -ErrorAction SilentlyContinue
 
+# Clean restart: stop any prior dropship app/worker/tunnel first so a re-launch
+# (e.g. recovering a dropped tunnel) doesn't collide on :3000. The app must be
+# restarted anyway because NextAuth needs AUTH_URL set to the NEW tunnel URL.
+Write-Host "Clearing any previous dropship instance..."
+Get-CimInstance Win32_Process -Filter "name='node.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -like "*next*" -or $_.CommandLine -like "*workers/index*" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "name='cloudflared.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -like "*localhost:3000*" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 1
+
 Write-Host "Building the production app (the first launch is the slowest)..."
 npm run build
 if ($LASTEXITCODE -ne 0) { Read-Host "Build failed - see above. Press Enter to exit"; exit 1 }

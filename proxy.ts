@@ -15,6 +15,6 @@ export const config = {
   // routes, and the Shopify webhook receiver (which authenticates via HMAC, not
   // a session — it must reach the handler, never be redirected to login).
   matcher: [
-    "/((?!api/auth|api/webhooks|_next/static|_next/image|favicon.ico|.*\\.svg$).*)",
+    "/((?!api/auth|api/webhooks|api/discovery|_next/static|_next/image|favicon.ico|.*\\.svg$).*)",
   ],
 };
